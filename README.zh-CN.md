@@ -43,6 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/ferry9303/ccpix/main/ccpix \
 ```sh
 ccpix                  # 列出包含图片的会话（id · 张数 · 第一句话）
 ccpix 9f3a             # 查看 id 以 9f3a 开头的会话里的全部图
+ccpix -L               # 显示最近一张粘贴/上传的图（跨会话，取代旧的 ccimg）
 ccpix 9f3a -o          # 用系统图片查看器打开（macOS 上是「预览」）
 ccpix 9f3a -w 60%      # 设置宽度（仅 imgcat 后端；如 60% / 600px / auto）
 ccpix 9f3a -b chafa    # 强制指定显示后端

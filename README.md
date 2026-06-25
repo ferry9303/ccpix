@@ -48,6 +48,7 @@ curl -fsSL https://raw.githubusercontent.com/ferry9303/ccpix/main/ccpix \
 ```sh
 ccpix                  # list sessions that contain images (id · count · first message)
 ccpix 9f3a             # view every image from the session whose id starts 9f3a
+ccpix -L               # show the most recent pasted/uploaded image (across sessions)
 ccpix 9f3a -o          # open them in the OS image viewer (Preview on macOS)
 ccpix 9f3a -w 60%      # set width (imgcat backend only; e.g. 60% / 600px / auto)
 ccpix 9f3a -b chafa    # force a display backend

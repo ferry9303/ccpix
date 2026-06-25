@@ -14,6 +14,7 @@ imgcat/chafa/kitten), or opens them in your OS image viewer.
 Usage:
     ccpix                     list sessions that contain images
     ccpix <id-prefix>         extract & show every image from that session
+    ccpix -L                  show the most recent pasted/uploaded image
     ccpix <id-prefix> -o      open them in the OS image viewer (Preview, …)
     ccpix <id-prefix> -w 60%  set width (imgcat only; e.g. 60% / 600px / auto)
     ccpix <id-prefix> -b chafa  force a display backend
@@ -244,6 +245,39 @@ def show(files: list[Path], backend: str, width: str) -> None:
 # ---------------------------------------------------------------------------
 # commands
 # ---------------------------------------------------------------------------
+IMG_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+
+def latest_image() -> Path | None:
+    """Newest pasted/uploaded image under the cache dirs (across all sessions)."""
+    cfg = config_dir()
+    newest: Path | None = None
+    newest_mtime = -1.0
+    for d in (cfg / "uploads", cfg / "image-cache"):
+        if not d.is_dir():
+            continue
+        for f in d.rglob("*"):
+            if f.suffix.lower() in IMG_EXTS and f.is_file():
+                m = f.stat().st_mtime
+                if m > newest_mtime:
+                    newest_mtime, newest = m, f
+    return newest
+
+
+def cmd_latest(do_open: bool, width: str, backend: str | None) -> int:
+    f = latest_image()
+    if not f:
+        print(f"没找到缓存的图片（{config_dir()}/uploads 与 image-cache 下为空）",
+              file=sys.stderr)
+        return 1
+    print(f"最近一张: {f}")
+    if do_open:
+        os_open([f])
+        return 0
+    show([f], backend or detect_backend(), width)
+    return 0
+
+
 def cmd_list() -> int:
     ts = transcripts()
     if not ts:
@@ -301,8 +335,12 @@ def main(argv: list[str] | None = None) -> int:
                    help="force a display backend (overrides auto-detect)")
     p.add_argument("-l", "--list", action="store_true",
                    help="list sessions with images (same as no session arg)")
+    p.add_argument("-L", "--latest", action="store_true",
+                   help="show the most recent pasted/uploaded image (across sessions)")
     args = p.parse_args(argv)
 
+    if args.latest:
+        return cmd_latest(args.open, args.width, args.backend)
     if args.list or not args.session:
         return cmd_list()
     return cmd_show(args.session, args.open, args.width, args.backend)
