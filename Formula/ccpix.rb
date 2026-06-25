@@ -1,10 +1,8 @@
 class Ccpix < Formula
   desc "View images from your Claude Code session transcripts in the terminal"
   homepage "https://github.com/ferry9303/ccpix"
-  # Stable release. After you create the git tag v0.1.0 on GitHub, replace the
-  # placeholder sha256 below with the real one (see README → "Release (maintainer)").
   url "https://github.com/ferry9303/ccpix/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "8c87bf012311b6aa1bd573b5e0d141fe98b7b5f403e9ad142a36a0762a0729f8"
   license "MIT"
   head "https://github.com/ferry9303/ccpix.git", branch: "main"
 
