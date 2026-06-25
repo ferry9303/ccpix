@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""ccpix — browse images from your Claude Code session transcripts.
+
+Claude Code stores every image you paste/upload (and images it reads/generates)
+as base64 *inside the session transcript*:
+    <claude-config>/projects/<project>/<session-id>.jsonl
+The on-disk image-cache (~/.claude/image-cache/<id>/) is an ephemeral cache that
+Claude prunes, so it is NOT a reliable place to look. The transcript is.
+
+This tool extracts those inline images straight from the transcript and shows
+them inline in the terminal (auto-detecting iTerm2 / Kitty graphics / Sixel via
+imgcat/chafa/kitten), or opens them in your OS image viewer.
+
+Usage:
+    ccpix                     list sessions that contain images
+    ccpix <id-prefix>         extract & show every image from that session
+    ccpix <id-prefix> -o      open them in the OS image viewer (Preview, …)
+    ccpix <id-prefix> -w 60%  set width (imgcat only; e.g. 60% / 600px / auto)
+    ccpix <id-prefix> -b chafa  force a display backend
+
+Backends (auto-detected, override with -b / $CCPIX_BACKEND):
+    imgcat   iTerm2 native (used automatically inside iTerm2)
+    chafa    cross-terminal; picks iTerm2/Kitty/Sixel protocol itself
+    kitten   kitty's `kitten icat` (Kitty graphics, works in Ghostty/kitty)
+    open     fall back to the OS image viewer
+
+Config dir resolution: $CLAUDE_CONFIG_DIR, else ~/.claude
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+EXT = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/gif": "gif",
+    "image/webp": "webp",
+}
+
+
+# ---------------------------------------------------------------------------
+# locating Claude's data
+# ---------------------------------------------------------------------------
+def config_dir() -> Path:
+    env = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(env).expanduser() if env else Path.home() / ".claude"
+
+
+def projects_dir() -> Path:
+    return config_dir() / "projects"
+
+
+def transcripts() -> list[Path]:
+    pd = projects_dir()
+    if not pd.is_dir():
+        return []
+    return sorted(pd.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def find_transcript(prefix: str) -> Path | None:
+    """First transcript whose session-id starts with `prefix` (newest wins)."""
+    for p in transcripts():
+        if p.stem.startswith(prefix):
+            return p
+    return None
+
+
+# ---------------------------------------------------------------------------
+# pulling images out of a transcript
+# ---------------------------------------------------------------------------
+def _walk_sources(obj):
+    """Yield every image `source` dict anywhere in a decoded JSON line."""
+    if isinstance(obj, dict):
+        if obj.get("type") == "image" and isinstance(obj.get("source"), dict):
+            yield obj["source"]
+        for v in obj.values():
+            yield from _walk_sources(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk_sources(v)
+
+
+def iter_images(transcript: Path):
+    """Yield (media_type, raw_bytes) for each *unique* base64 image, in order."""
+    seen: set[str] = set()
+    with transcript.open(encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            for src in _walk_sources(d):
+                if src.get("type") != "base64":
+                    continue
+                data = src.get("data")
+                if not data:
+                    continue
+                h = hashlib.md5(data.encode("utf-8", "replace")).hexdigest()
+                if h in seen:
+                    continue
+                seen.add(h)
+                try:
+                    raw = base64.b64decode(data)
+                except Exception:
+                    continue
+                yield src.get("media_type", "image/png"), raw
+
+
+def count_images(transcript: Path) -> int:
+    # Cheap pre-filter: skip files that clearly hold no inline image.
+    try:
+        head = transcript.read_bytes()
+    except OSError:
+        return 0
+    if b'"image"' not in head:
+        return 0
+    return sum(1 for _ in iter_images(transcript))
+
+
+def extract(transcript: Path, outdir: Path) -> list[Path]:
+    if outdir.exists():
+        shutil.rmtree(outdir, ignore_errors=True)
+    outdir.mkdir(parents=True, exist_ok=True)
+    out: list[Path] = []
+    for i, (media, raw) in enumerate(iter_images(transcript), 1):
+        ext = EXT.get(media, "png")
+        f = outdir / f"{i:03d}.{ext}"
+        f.write_bytes(raw)
+        out.append(f)
+    return out
+
+
+# Lines Claude Code injects into the user role that aren't real user prose.
+_NOISE_PREFIXES = (
+    "<local-command", "<command-", "<system-reminder", "<bash-",
+    "Caveat: The messages below", "[Request interrupted",
+)
+
+
+def first_user_text(transcript: Path) -> str:
+    """First *real* user message text, skipping injected command/caveat lines."""
+    try:
+        with transcript.open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"user"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                msg = d.get("message") or {}
+                c = msg.get("content")
+                if isinstance(c, str):
+                    text = c
+                elif isinstance(c, list):
+                    text = next(
+                        (p.get("text", "") for p in c
+                         if isinstance(p, dict) and p.get("type") == "text"),
+                        "",
+                    )
+                else:
+                    continue
+                text = re.sub(r"\s+", " ", text).strip()
+                if not text or text.startswith(_NOISE_PREFIXES):
+                    continue
+                return text[:60]
+    except OSError:
+        pass
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# display
+# ---------------------------------------------------------------------------
+def imgcat_bin() -> str | None:
+    p = shutil.which("imgcat")
+    if p:
+        return p
+    fallback = "/Applications/iTerm.app/Contents/Resources/utilities/imgcat"
+    return fallback if os.path.exists(fallback) else None
+
+
+def detect_backend() -> str:
+    forced = os.environ.get("CCPIX_BACKEND")
+    if forced:
+        return forced
+    if os.environ.get("TERM_PROGRAM") == "iTerm.app" and imgcat_bin():
+        return "imgcat"
+    if shutil.which("chafa"):
+        return "chafa"
+    if shutil.which("kitten"):
+        return "kitten"
+    return "open"
+
+
+def os_open(files: list[Path]) -> None:
+    sysname = platform.system()
+    if sysname == "Darwin":
+        subprocess.run(["open", *map(str, files)])
+    elif sysname == "Windows":
+        for f in files:
+            os.startfile(str(f))  # type: ignore[attr-defined]
+    else:
+        for f in files:
+            subprocess.run(["xdg-open", str(f)])
+
+
+def show(files: list[Path], backend: str, width: str) -> None:
+    if backend == "open":
+        print("（终端无内联图能力或被指定，改用系统图片查看器打开）")
+        os_open(files)
+        return
+    for f in files:
+        print(f"── {f.name}")
+        if backend == "imgcat":
+            ic = imgcat_bin()
+            if not ic:
+                print("  (找不到 imgcat，回退 open)"); os_open([f]); continue
+            subprocess.run([ic, "-r", "-W", width, str(f)])
+        elif backend == "chafa":
+            subprocess.run(["chafa", str(f)])
+        elif backend == "kitten":
+            subprocess.run(["kitten", "icat", str(f)])
+        else:
+            print(f"  (未知后端 {backend!r}，回退 open)"); os_open([f])
+
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+def cmd_list() -> int:
+    ts = transcripts()
+    if not ts:
+        print(f"没找到任何会话记录（{projects_dir()} 不存在或为空）", file=sys.stderr)
+        return 1
+    rows = []
+    for t in ts:
+        n = count_images(t)
+        if n:
+            rows.append((t.stem, n, first_user_text(t)))
+    if not rows:
+        print("没有任何会话包含内联图片。")
+        return 0
+    idw = max(len(r[0]) for r in rows)
+    for sid, n, label in rows:
+        print(f"{sid:<{idw}}  {n:>3}张  {label}")
+    return 0
+
+
+def cmd_show(prefix: str, do_open: bool, width: str, backend: str | None) -> int:
+    t = find_transcript(prefix)
+    if not t:
+        print(f"没找到匹配的会话: {prefix}", file=sys.stderr)
+        return 1
+    sid = t.stem
+    outdir = Path(tempfile.gettempdir()) / f"ccpix-{sid}"
+    files = extract(t, outdir)
+    if not files:
+        print("（该会话的 transcript 里没有内联图片）")
+        return 0
+    if do_open:
+        print(f"在系统图片查看器打开 {sid} 的 {len(files)} 张图…（已导出到 {outdir}）")
+        os_open(files)
+        return 0
+    be = backend or detect_backend()
+    print(f"session: {sid}  →  {len(files)} 张图  "
+          f"(后端 {be}，已导出到 {outdir}；预览打开: ccpix {prefix} -o)")
+    show(files, be, width)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(
+        prog="ccpix",
+        description="Browse images from your Claude Code session transcripts.",
+    )
+    p.add_argument("session", nargs="?",
+                   help="session id (prefix). Omit to list sessions with images.")
+    p.add_argument("-o", "--open", action="store_true",
+                   help="open in the OS image viewer instead of the terminal")
+    p.add_argument("-w", "--width", default="85%",
+                   help="image width for imgcat (e.g. 60%%, 600px, auto). default 85%%")
+    p.add_argument("-b", "--backend",
+                   choices=["imgcat", "chafa", "kitten", "open"],
+                   help="force a display backend (overrides auto-detect)")
+    p.add_argument("-l", "--list", action="store_true",
+                   help="list sessions with images (same as no session arg)")
+    args = p.parse_args(argv)
+
+    if args.list or not args.session:
+        return cmd_list()
+    return cmd_show(args.session, args.open, args.width, args.backend)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
