@@ -13,9 +13,10 @@ class Ccpix < Formula
 
   def install
     bin.install "ccpix"
-    # Pin the interpreter to Homebrew's python so it works regardless of PATH.
-    inreplace bin/"ccpix", %r{\A#!/usr/bin/env python3},
-              "#!#{Formula["python@3.13"].opt_bin}/python3"
+    # Pin the interpreter to Homebrew's python (keg-only; its bin ships
+    # python3.13, not python3) so it runs regardless of the user's PATH.
+    inreplace bin/"ccpix", %r{\A#!/usr/bin/env python3$},
+              "#!#{Formula["python@3.13"].opt_bin}/python3.13"
   end
 
   test do
